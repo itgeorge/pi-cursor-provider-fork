@@ -1,8 +1,11 @@
 import rawModels from "./cursor-models-raw.json";
 import { afterEach, describe, expect, test } from "vitest";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as pathJoin } from "node:path";
 import { request as httpRequest } from "node:http";
-import { buildEffortMap, FALLBACK_MODELS, parseModelId, processModels, registerSessionLifecycleCleanup, supportsReasoningModelId } from "./index.ts";
+import cursorProviderExtension, { buildEffortMap, FALLBACK_MODELS, getStoredCursorAccessToken, parseModelId, processModels, registerSessionLifecycleCleanup, supportsReasoningModelId } from "./index.ts";
 import {
   resolveModelId,
   __testInternals,
@@ -41,6 +44,7 @@ import {
   SetBlobArgsSchema,
   TextDeltaUpdateSchema,
   UserMessageSchema,
+  GetUsableModelsResponseSchema,
 } from "./proto/agent_pb.ts";
 
 afterEach(() => {
@@ -184,6 +188,127 @@ describe("reasoning support", () => {
     expect(FALLBACK_MODELS.length).toBeGreaterThan(0);
     expect(FALLBACK_MODELS.find((model) => model.id === "gpt-5.4-medium")?.reasoning).toBe(true);
     expect(FALLBACK_MODELS.find((model) => model.id === "composer-2")?.reasoning).toBe(true);
+  });
+});
+
+describe("stored cursor auth", () => {
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+
+  afterEach(() => {
+    if (originalAgentDir === undefined) {
+      delete process.env.PI_CODING_AGENT_DIR;
+    } else {
+      process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    }
+  });
+
+  function withAuthJson(authJson: unknown, fn: () => void) {
+    const dir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-test-"));
+    try {
+      process.env.PI_CODING_AGENT_DIR = dir;
+      writeFileSync(pathJoin(dir, "auth.json"), JSON.stringify(authJson), "utf8");
+      fn();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  test("reads a valid stored Cursor OAuth access token", () => {
+    withAuthJson({
+      cursor: {
+        type: "oauth",
+        access: "access-token",
+        refresh: "refresh-token",
+        expires: 2_000,
+      },
+    }, () => {
+      expect(getStoredCursorAccessToken(1_000)).toBe("access-token");
+    });
+  });
+
+  test("ignores expired stored Cursor OAuth credentials", () => {
+    withAuthJson({
+      cursor: {
+        type: "oauth",
+        access: "access-token",
+        refresh: "refresh-token",
+        expires: 1_000,
+      },
+    }, () => {
+      expect(getStoredCursorAccessToken(2_000)).toBeUndefined();
+    });
+  });
+
+  test("ignores non-OAuth Cursor credentials", () => {
+    withAuthJson({ cursor: { type: "api_key", key: "not-oauth" } }, () => {
+      expect(getStoredCursorAccessToken(1_000)).toBeUndefined();
+    });
+  });
+
+  async function withAuthJsonAsync(authJson: unknown, fn: () => Promise<void>) {
+    const dir = mkdtempSync(pathJoin(tmpdir(), "pi-cursor-provider-test-"));
+    try {
+      process.env.PI_CODING_AGENT_DIR = dir;
+      writeFileSync(pathJoin(dir, "auth.json"), JSON.stringify(authJson), "utf8");
+      await fn();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  test("registers live models discovered with stored OAuth credentials on startup", async () => {
+    await withAuthJsonAsync({
+      cursor: {
+        type: "oauth",
+        access: "stored-access-token",
+        refresh: "refresh-token",
+        expires: 4_102_444_800_000,
+      },
+    }, async () => {
+      const discoveryResponse = toBinary(GetUsableModelsResponseSchema, create(GetUsableModelsResponseSchema, {
+        models: [
+          { modelId: "composer-2.5", displayName: "Composer 2.5" },
+          { modelId: "composer-2.5-fast", displayName: "Composer 2.5 Fast" },
+        ],
+      }));
+
+      expect(FALLBACK_MODELS.map((model) => model.id)).not.toEqual(
+        expect.arrayContaining(["composer-2.5", "composer-2.5-fast"]),
+      );
+
+      setBridgeFactoryForTests(() => {
+        let dataCb: ((chunk: Buffer) => void) | undefined;
+        let closeCb: ((code: number) => void) | undefined;
+        return {
+          proc: { kill: () => true },
+          get alive() { return true; },
+          write() {},
+          end() {
+            dataCb?.(Buffer.from(discoveryResponse));
+            closeCb?.(0);
+          },
+          onData(cb) { dataCb = cb; },
+          onClose(cb) { closeCb = cb; },
+        };
+      });
+
+      const registrations: Array<{ name: string; config: any }> = [];
+      const pi = {
+        on() {},
+        registerProvider(name: string, config: any) {
+          registrations.push({ name, config });
+        },
+      };
+
+      await cursorProviderExtension(pi as any);
+
+      const cursorRegistration = registrations.find((registration) => registration.name === "cursor");
+      expect(cursorRegistration).toBeDefined();
+      expect(cursorRegistration!.config.models.map((model: { id: string }) => model.id)).toEqual([
+        "composer-2.5",
+        "composer-2.5-fast",
+      ]);
+    });
   });
 });
 

@@ -13,9 +13,9 @@
  */
 
 import rawFallbackModels from "./cursor-models-raw.json";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@mariozechner/pi-ai";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 import {
@@ -360,6 +360,36 @@ export const FALLBACK_MODELS: CursorModel[] = (rawFallbackModels as CursorModel[
   reasoning: supportsReasoningModelId(model.id),
 }));
 
+function isOfflineMode(): boolean {
+  const raw = process.env.PI_OFFLINE?.trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+}
+
+export function getStoredCursorAccessToken(now = Date.now()): string | undefined {
+  try {
+    const authPath = pathJoin(getAgentDir(), "auth.json");
+    const parsed = JSON.parse(readFileSync(authPath, "utf8")) as Record<string, unknown>;
+    const credential = parsed.cursor;
+    if (!credential || typeof credential !== "object") return undefined;
+
+    const cursorCredential = credential as Record<string, unknown>;
+    if (cursorCredential.type !== "oauth") return undefined;
+
+    const access = cursorCredential.access;
+    if (typeof access !== "string" || access.length === 0) return undefined;
+
+    const expires = cursorCredential.expires;
+    if (typeof expires === "number" && Number.isFinite(expires) && now >= expires) return undefined;
+
+    return access;
+  } catch (error) {
+    debugExtensionLog("startup_models.read_auth_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return undefined;
+  }
+}
+
 // ── Extension ──
 
 export function registerSessionLifecycleCleanup(pi: ExtensionAPI) {
@@ -488,7 +518,27 @@ export default async function (pi: ExtensionAPI) {
 
   // Await proxy so models are registered before pi proceeds with model resolution.
   const port = await proxyReady;
-  register(pi, port, FALLBACK_MODELS);
+  let initialModels = FALLBACK_MODELS;
+
+  if (!isOfflineMode()) {
+    const storedAccessToken = getStoredCursorAccessToken();
+    if (storedAccessToken) {
+      currentToken = storedAccessToken;
+      const discovered = await getCursorModels(storedAccessToken);
+      if (discovered.length > 0) {
+        initialModels = discovered;
+        debugExtensionLog("startup_models.discovered", { count: discovered.length });
+      } else {
+        debugExtensionLog("startup_models.fallback_after_empty_discovery");
+      }
+    } else {
+      debugExtensionLog("startup_models.no_stored_token");
+    }
+  } else {
+    debugExtensionLog("startup_models.skipped_offline");
+  }
+
+  register(pi, port, initialModels);
 
   function register(pi: ExtensionAPI, port: number, rawModels: CursorModel[]) {
     const baseUrl = `http://127.0.0.1:${port}/v1`;
