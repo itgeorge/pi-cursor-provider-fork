@@ -482,7 +482,29 @@ function registerExtensionDebugHooks(pi: ExtensionAPI) {
   debugExtensionLog("extension.debug_hooks_registered", { logFile: getExtensionDebugLogFilePath() });
 }
 
-export default async function (pi: ExtensionAPI) {
+async function loadStartupModels(): Promise<{ models: CursorModel[]; accessToken: string }> {
+  if (isOfflineMode()) {
+    debugExtensionLog("startup_models.skipped_offline");
+    return { models: FALLBACK_MODELS, accessToken: "" };
+  }
+
+  const storedAccessToken = getStoredCursorAccessToken();
+  if (!storedAccessToken) {
+    debugExtensionLog("startup_models.no_stored_token");
+    return { models: FALLBACK_MODELS, accessToken: "" };
+  }
+
+  const discovered = await getCursorModels(storedAccessToken);
+  if (discovered.length > 0) {
+    debugExtensionLog("startup_models.discovered", { count: discovered.length });
+    return { models: discovered, accessToken: storedAccessToken };
+  }
+
+  debugExtensionLog("startup_models.fallback_after_empty_discovery");
+  return { models: FALLBACK_MODELS, accessToken: storedAccessToken };
+}
+
+async function setupCursorProviderExtension(pi: ExtensionAPI): Promise<void> {
   // Current access token, updated by login/refresh/getApiKey
   let currentToken = "";
 
@@ -518,27 +540,10 @@ export default async function (pi: ExtensionAPI) {
 
   // Await proxy so models are registered before pi proceeds with model resolution.
   const port = await proxyReady;
-  let initialModels = FALLBACK_MODELS;
+  const startup = await loadStartupModels();
+  currentToken = startup.accessToken;
 
-  if (!isOfflineMode()) {
-    const storedAccessToken = getStoredCursorAccessToken();
-    if (storedAccessToken) {
-      currentToken = storedAccessToken;
-      const discovered = await getCursorModels(storedAccessToken);
-      if (discovered.length > 0) {
-        initialModels = discovered;
-        debugExtensionLog("startup_models.discovered", { count: discovered.length });
-      } else {
-        debugExtensionLog("startup_models.fallback_after_empty_discovery");
-      }
-    } else {
-      debugExtensionLog("startup_models.no_stored_token");
-    }
-  } else {
-    debugExtensionLog("startup_models.skipped_offline");
-  }
-
-  register(pi, port, initialModels);
+  register(pi, port, startup.models);
 
   function register(pi: ExtensionAPI, port: number, rawModels: CursorModel[]) {
     const baseUrl = `http://127.0.0.1:${port}/v1`;
@@ -590,6 +595,8 @@ export default async function (pi: ExtensionAPI) {
       },
     });
   }
+}
 
-
+export default async function (pi: ExtensionAPI) {
+  await setupCursorProviderExtension(pi);
 }
