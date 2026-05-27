@@ -310,6 +310,47 @@ describe("stored cursor auth", () => {
       ]);
     });
   });
+
+  test("falls back to fallback models when discovery fails for a stored token", async () => {
+    await withAuthJsonAsync({
+      cursor: {
+        type: "oauth",
+        access: "invalid-stored-token",
+        refresh: "refresh-token",
+        expires: 4_102_444_800_000,
+      },
+    }, async () => {
+      setBridgeFactoryForTests(() => {
+        let closeCb: ((code: number) => void) | undefined;
+        return {
+          proc: { kill: () => true },
+          get alive() { return true; },
+          write() {},
+          end() {
+            closeCb?.(1);
+          },
+          onData() {},
+          onClose(cb) { closeCb = cb; },
+        };
+      });
+
+      const registrations: Array<{ name: string; config: any }> = [];
+      const pi = {
+        on() {},
+        registerProvider(name: string, config: any) {
+          registrations.push({ name, config });
+        },
+      };
+
+      await expect(cursorProviderExtension(pi as any)).resolves.toBeUndefined();
+
+      const cursorRegistration = registrations.find((registration) => registration.name === "cursor");
+      expect(cursorRegistration).toBeDefined();
+      const registeredIds = cursorRegistration!.config.models.map((model: { id: string }) => model.id);
+      const fallbackIds = processModels(FALLBACK_MODELS).map((model) => model.id);
+      expect(registeredIds).toEqual(fallbackIds);
+    });
+  });
 });
 
 describe("processModels", () => {

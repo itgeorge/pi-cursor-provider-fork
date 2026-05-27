@@ -295,6 +295,7 @@ export const __testInternals = {
 
 export function setBridgeFactoryForTests(factory?: BridgeFactory): void {
   bridgeFactory = factory ?? spawnBridge;
+  cachedModels = null;
 }
 
 let proxyServer: ReturnType<typeof createServer> | undefined;
