@@ -631,7 +631,40 @@ export function evictStaleConversations(now = Date.now()): void {
  *      model="gpt-5.4-fast" + effort="high" → "gpt-5.4-high-fast"
  * If no effort provided, returns model as-is.
  */
+export interface ModelResolutionEntry {
+  /** Exact upstream Cursor model ID when no reasoning effort is requested. */
+  defaultId: string;
+  /** pi thinking level (minimal/low/medium/high/xhigh) → exact upstream Cursor model ID. */
+  byEffort: Record<string, string>;
+}
+
+/**
+ * Exact model resolution table built from discovered Cursor models.
+ * Pi sends raw pi thinking levels as `reasoning_effort` (it reads
+ * model.thinkingLevelMap, not compat maps), so the proxy must clamp levels
+ * against actually-available variants — including Cursor's two different
+ * suffix orders (`{base}-{effort}-thinking` vs `{base}-thinking-{effort}`).
+ */
+const modelResolutionTable = new Map<string, ModelResolutionEntry>();
+
+export function setModelResolutionTable(entries?: Iterable<[string, ModelResolutionEntry]>): void {
+  modelResolutionTable.clear();
+  if (entries) {
+    for (const [id, entry] of entries) modelResolutionTable.set(id, entry);
+  }
+}
+
 export function resolveModelId(model: string, reasoningEffort?: string): string {
+  const entry = modelResolutionTable.get(model);
+  if (entry) {
+    if (reasoningEffort) {
+      const mapped = entry.byEffort[reasoningEffort];
+      if (mapped) return mapped;
+    }
+    return entry.defaultId;
+  }
+
+  // Legacy fallback for models absent from the table (e.g. PI_CURSOR_RAW_MODELS).
   if (!reasoningEffort) return model;
 
   let suffix = "";

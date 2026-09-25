@@ -24,7 +24,7 @@ import {
   pollCursorAuth,
   refreshCursorToken,
 } from "./auth.js";
-import { cleanupSessionState, getCursorModels, startProxy, type CursorModel } from "./proxy.js";
+import { cleanupSessionState, getCursorModels, setModelResolutionTable, startProxy, type CursorModel } from "./proxy.js";
 
 // ── Cost estimation ──
 
@@ -245,6 +245,10 @@ export function parseModelId(id: string): ParsedModelId {
 interface ProcessedModel extends CursorModel {
   supportsEffort: boolean;
   effortMap?: Record<string, string>;
+  /** Exact upstream Cursor model ID to use when no reasoning effort is requested. */
+  defaultModelId: string;
+  /** pi thinking level → exact upstream Cursor model ID (only for collapsed effort groups). */
+  effortModelIds?: Record<string, string>;
 }
 
 export function supportsReasoningModelId(id: string): boolean {
@@ -322,11 +326,20 @@ export function processModels(raw: CursorModel[]): ProcessedModel[] {
 
       const effortMap = buildEffortMap(new Set(g.efforts.keys()));
 
-      result.push({ ...rep, id, supportsEffort: true, effortMap });
+      // Map each pi level to the exact upstream model ID. Reconstruction
+      // (base-effort-thinking) is unreliable because Cursor uses both
+      // `{base}-{effort}-thinking` and `{base}-thinking-{effort}` orders.
+      const effortModelIds: Record<string, string> = {};
+      for (const [level, effort] of Object.entries(effortMap)) {
+        const target = g.efforts.get(effort);
+        if (target) effortModelIds[level] = target.id;
+      }
+
+      result.push({ ...rep, id, supportsEffort: true, effortMap, effortModelIds, defaultModelId: rep.id });
     } else {
       // Keep single entries as-is (base model without effort variants)
       for (const model of g.efforts.values()) {
-        result.push({ ...model, supportsEffort: false });
+        result.push({ ...model, supportsEffort: false, defaultModelId: model.id });
       }
     }
   }
@@ -548,8 +561,10 @@ async function setupCursorProviderExtension(pi: ExtensionAPI): Promise<void> {
   function register(pi: ExtensionAPI, port: number, rawModels: CursorModel[]) {
     const baseUrl = `http://127.0.0.1:${port}/v1`;
     const processed = skipDedup
-      ? rawModels.map(m => ({ ...m, supportsEffort: false } as ProcessedModel))
+      ? rawModels.map(m => ({ ...m, supportsEffort: false, defaultModelId: m.id } as ProcessedModel))
       : processModels(rawModels);
+
+    setModelResolutionTable(processed.map((pm) => [pm.id, { defaultId: pm.defaultModelId, byEffort: pm.effortModelIds ?? {} }]));
 
     pi.registerProvider("cursor", {
       baseUrl,

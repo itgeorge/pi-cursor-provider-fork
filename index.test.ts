@@ -9,6 +9,7 @@ import cursorProviderExtension, { buildEffortMap, FALLBACK_MODELS, getStoredCurs
 import {
   resolveModelId,
   resolveCursorClientVersion,
+  setModelResolutionTable,
   __testInternals,
   cleanupAllSessionState,
   cleanupSessionState,
@@ -51,6 +52,7 @@ import {
 afterEach(() => {
   stopProxy();
   setBridgeFactoryForTests();
+  setModelResolutionTable();
   cleanupAllSessionState();
 });
 
@@ -567,6 +569,58 @@ describe("resolveModelId", () => {
 
   test("spark-preview model + effort", () => {
     expect(resolveModelId("gpt-5.3-codex-spark-preview", "xhigh")).toBe("gpt-5.3-codex-spark-preview-xhigh");
+  });
+});
+
+describe("resolveModelId with resolution table", () => {
+  function seedTable() {
+    // Mirrors Cursor's live model list: old `{base}-{effort}-thinking` order
+    // (claude-4.6-opus) and new `{base}-thinking-{effort}` order (opus-4-8),
+    // plus effort-only groups without a no-suffix default (cursor-grok-4.6).
+    const raw = [
+      m("claude-4.6-opus-high-thinking"), m("claude-4.6-opus-max-thinking"),
+      m("claude-opus-4-8-thinking-low"), m("claude-opus-4-8-thinking-medium"), m("claude-opus-4-8-thinking-high"), m("claude-opus-4-8-thinking-max"),
+      m("cursor-grok-4.6-low"), m("cursor-grok-4.6-medium"), m("cursor-grok-4.6-high"), m("cursor-grok-4.6-xhigh"),
+      m("composer-2.5"),
+    ];
+    const processed = processModels(raw);
+    setModelResolutionTable(processed.map((pm) => [pm.id, { defaultId: pm.defaultModelId, byEffort: pm.effortModelIds ?? {} }]));
+    return processed;
+  }
+
+  test("new thinking suffix order resolves to exact upstream IDs", () => {
+    seedTable();
+    expect(resolveModelId("claude-opus-4-8-thinking", "high")).toBe("claude-opus-4-8-thinking-high");
+    expect(resolveModelId("claude-opus-4-8-thinking", "xhigh")).toBe("claude-opus-4-8-thinking-max");
+    expect(resolveModelId("claude-opus-4-8-thinking", "low")).toBe("claude-opus-4-8-thinking-low");
+  });
+
+  test("old thinking suffix order still resolves correctly", () => {
+    seedTable();
+    expect(resolveModelId("claude-4.6-opus-thinking", "high")).toBe("claude-4.6-opus-high-thinking");
+    expect(resolveModelId("claude-4.6-opus-thinking", "xhigh")).toBe("claude-4.6-opus-max-thinking");
+  });
+
+  test("effort-only group without bare variant resolves bare id to default and clamps unknown levels", () => {
+    seedTable();
+    expect(resolveModelId("cursor-grok-4.6")).toBe("cursor-grok-4.6-medium");
+    expect(resolveModelId("cursor-grok-4.6", "high")).toBe("cursor-grok-4.6-high");
+    // "minimal" is not an upstream effort for grok-4.6 — clamp to lowest available
+    expect(resolveModelId("cursor-grok-4.6", "minimal")).toBe("cursor-grok-4.6-low");
+    // Unknown level → sensible default instead of a nonexistent suffix
+    expect(resolveModelId("cursor-grok-4.6", "off")).toBe("cursor-grok-4.6-medium");
+  });
+
+  test("non-collapsed model ignores effort", () => {
+    seedTable();
+    expect(resolveModelId("composer-2.5")).toBe("composer-2.5");
+    expect(resolveModelId("composer-2.5", "high")).toBe("composer-2.5");
+  });
+
+  test("model absent from table falls back to legacy suffix insertion", () => {
+    seedTable();
+    expect(resolveModelId("gpt-5.4", "high")).toBe("gpt-5.4-high");
+    expect(resolveModelId("gpt-5.4-fast", "high")).toBe("gpt-5.4-high-fast");
   });
 });
 

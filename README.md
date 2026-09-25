@@ -80,6 +80,8 @@ pi selects: gpt-5.4       +  effort: medium  →  Cursor receives: gpt-5.4-mediu
 pi selects: composer-2     +  (no effort)     →  Cursor receives: composer-2
 ```
 
+Effort is resolved against the discovered model list using **exact upstream IDs**, not string surgery — Cursor uses two different suffix orders (`{base}-{effort}-thinking` for older models, `{base}-thinking-{effort}` for newer ones), and effort levels pi requests that don't exist upstream (e.g. `minimal` on `cursor-grok-4.6`, `xhigh` on Claude groups with `max`) are clamped to the closest available variant. Collapsed models without a bare upstream variant (e.g. `cursor-grok-4.6`) resolve to their default effort variant (usually `medium`) when no effort is requested.
+
 When a group is **collapsed**, the proxy registers one model with `supportsReasoningEffort: true` and an internal effort map (see table above).
 
 **Collapsed** when Cursor returns either:
