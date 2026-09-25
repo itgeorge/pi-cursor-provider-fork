@@ -187,6 +187,12 @@ describe("reasoning support", () => {
     expect(supportsReasoningModelId("totally-unknown-model")).toBe(false);
   });
 
+  test("cursor- prefixed vendor ids count as reasoning", () => {
+    expect(supportsReasoningModelId("cursor-grok-4.5")).toBe(true);
+    expect(supportsReasoningModelId("cursor-grok-4.6")).toBe(true);
+    expect(supportsReasoningModelId("cursor-grok-4.6-fast")).toBe(true);
+  });
+
   test("fallback models keep derived reasoning enabled", () => {
     expect(FALLBACK_MODELS.length).toBeGreaterThan(0);
     expect(FALLBACK_MODELS.find((model) => model.id === "gpt-5.4-medium")?.reasoning).toBe(true);

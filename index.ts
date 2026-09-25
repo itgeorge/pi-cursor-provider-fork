@@ -255,7 +255,10 @@ export function supportsReasoningModelId(id: string): boolean {
   const { base, effort, thinking } = parseModelId(id);
   if (effort || thinking) return true;
   if (base === "default") return true;
-  return /^(claude|composer|gemini|gpt|grok|kimi)(-|$)/i.test(base);
+  // Some Cursor models carry a vendor prefix (e.g. cursor-grok-4.6) — strip
+  // it before matching known reasoning families.
+  const normalizedBase = base.replace(/^cursor-/i, "");
+  return /^(claude|composer|gemini|gpt|grok|kimi|muse)(-|$)/i.test(normalizedBase);
 }
 
 /**

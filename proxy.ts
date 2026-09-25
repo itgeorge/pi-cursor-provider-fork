@@ -577,6 +577,9 @@ export async function startProxy(
       if (typeof addr === "object" && addr) {
         proxyPort = addr.port;
         proxyServer = server;
+        // Don't keep the process alive just for the proxy — otherwise
+        // `pi -p` (print mode) hangs after completing instead of exiting.
+        server.unref();
         debugLog("proxy.start", { port: proxyPort, debugLogFile: isProxyDebugEnabled() ? getDebugLogFilePath() : undefined });
         resolve(proxyPort);
       } else {
