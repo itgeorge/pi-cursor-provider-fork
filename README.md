@@ -136,6 +136,21 @@ That reconstruction preserves:
 - tool results
 - final assistant text after tool results
 
+## Resilience
+
+Cursor agent runs can take minutes before emitting the first frame (thinking models, large contexts). The proxy protects those long runs:
+
+- **Immediate header flush** — SSE response headers are sent as soon as the upstream run starts, so client-side request timeouts (pi's `httpIdleTimeoutMs`) don't kill slow first tokens with `Request timed out.`
+- **SSE keepalives** — comment pings every 15s keep the connection alive during long upstream thinking gaps.
+- **Transient retry** — transient upstream errors (`resource_exhausted`, `unavailable`, `deadline_exceeded`, `aborted`, `internal`) and sudden bridge disconnects transparently restart the run (up to 2 attempts, with backoff) as long as no output has been emitted yet.
+- **Checkpoint preservation** — transient failures keep the stored conversation checkpoint so the next request resumes instead of rebuilding the full history.
+
+The proxy identifies as a current Cursor CLI (`x-cursor-client-version`), since Cursor gates model availability by client version. Override with:
+
+```bash
+PI_CURSOR_CLIENT_VERSION=cli-2026.09.23-86fc751 pi
+```
+
 ## Requirements
 
 - [Pi](https://github.com/badlogic/pi-mono)

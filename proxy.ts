@@ -76,6 +76,23 @@ import {
 } from "./proto/agent_pb.js";
 
 const CURSOR_API_URL = "https://api2.cursor.sh";
+
+/**
+ * Cursor gates model availability by client version, so we identify as a
+ * recent Cursor CLI. Override with PI_CURSOR_CLIENT_VERSION if needed.
+ */
+const DEFAULT_CURSOR_CLIENT_VERSION = "cli-2026.09.23-86fc751";
+
+export function resolveCursorClientVersion(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.PI_CURSOR_CLIENT_VERSION?.trim();
+  return override || DEFAULT_CURSOR_CLIENT_VERSION;
+}
+
+/** Interval for SSE comment keepalives that hold the client connection open during long upstream thinking gaps. */
+const SSE_KEEPALIVE_INTERVAL_MS = 15_000;
+/** Max transparent restarts of the upstream run after a transient Connect error (only safe before any output was emitted). */
+const TRANSIENT_RETRY_MAX = 2;
+const TRANSIENT_RETRY_BASE_DELAY_MS = 2_000;
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 // Use import.meta.url for bridge path resolution (jiti supports this)
 const BRIDGE_PATH = pathResolve(dirname(fileURLToPath(import.meta.url)), "h2-bridge.mjs");
@@ -337,6 +354,7 @@ function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
     url: options.url ?? CURSOR_API_URL,
     path: options.rpcPath,
     unary: options.unary ?? false,
+    clientVersion: resolveCursorClientVersion(),
   });
   proc.stdin!.write(lpEncode(new TextEncoder().encode(config)));
 
@@ -1461,14 +1479,51 @@ function createConnectFrameParser(
   };
 }
 
-function parseConnectEndStream(data: Uint8Array): Error | null {
+interface ConnectStreamError {
+  code: string | null;
+  message: string;
+}
+
+function parseConnectEndStream(data: Uint8Array): ConnectStreamError | null {
   try {
     const payload = JSON.parse(new TextDecoder().decode(data));
     const error = payload?.error;
-    if (error) return new Error(`Connect error ${error.code ?? "unknown"}: ${error.message ?? "Unknown error"}`);
+    if (error) {
+      const code = typeof error.code === "string" && error.code ? error.code : null;
+      const message = typeof error.message === "string" && error.message ? error.message : "Unknown error";
+      return { code, message: `Connect error ${code ?? "unknown"}: ${message}` };
+    }
     return null;
   } catch {
-    return new Error("Failed to parse Connect end stream");
+    return { code: null, message: "Failed to parse Connect end stream" };
+  }
+}
+
+/** Connect codes that are worth retrying (rate limits, transient backend failures). */
+const TRANSIENT_CONNECT_CODES = new Set([
+  "resource_exhausted",
+  "unavailable",
+  "deadline_exceeded",
+  "aborted",
+  "internal",
+]);
+
+function isTransientConnectCode(code: string | null): boolean {
+  return code !== null && TRANSIENT_CONNECT_CODES.has(code);
+}
+
+/**
+ * Flush response headers immediately. Node buffers writeHead() output until
+ * the first body chunk, but Cursor agent runs can take minutes before the
+ * first frame. Clients (e.g. pi via the OpenAI SDK) apply a request timeout
+ * that only clears once headers arrive, so a slow first token would
+ * otherwise kill the request with "Request timed out.".
+ */
+function flushResponseHeaders(res: ServerResponse): void {
+  try {
+    res.flushHeaders?.();
+  } catch {
+    // best-effort; fake responses in tests may not implement it
   }
 }
 
@@ -1507,6 +1562,7 @@ function respondWithPendingToolCalls(
       "Cache-Control": "no-cache",
       "Connection": "keep-alive",
     });
+    flushResponseHeaders(res);
     for (const toolCall of toolCalls) {
       res.write(`data: ${JSON.stringify({
         id: completionId,
@@ -1580,6 +1636,9 @@ function handleStreamingResponse(
     req,
     res,
     requestId,
+    // Fresh runs can be transparently restarted on transient upstream errors
+    // as long as no output reached the client yet.
+    () => startBridge(accessToken, payload.requestBytes),
   );
 }
 
@@ -1623,6 +1682,7 @@ function writeSSEStream(
   req: IncomingMessage,
   res: ServerResponse,
   requestId?: string,
+  restartBridge?: () => { bridge: BridgeHandle; heartbeatTimer: ReturnType<typeof setInterval> },
 ): void {
   debugLog("stream.writer_start", { requestId, bridgeKey, convKey, modelId, completedTurnCount: completedTurns.length, currentTurn });
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
@@ -1633,19 +1693,49 @@ function writeSSEStream(
     "Cache-Control": "no-cache",
     "Connection": "keep-alive",
   });
+  // Flush headers immediately: clients apply a request timeout that only
+  // clears once headers arrive, and Cursor runs can take minutes to emit the
+  // first frame (see flushResponseHeaders).
+  flushResponseHeaders(res);
 
   let closed = false;
+  // True once any SSE data chunk reached the client. While false, a failed
+  // upstream run can be transparently restarted because no partial output
+  // was emitted yet.
+  let emittedOutput = false;
   const sendSSE = (data: object) => {
     if (closed) return;
+    emittedOutput = true;
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
   const sendDone = () => {
     if (closed) return;
     res.write("data: [DONE]\n\n");
   };
+
+  // SSE comment keepalives protect long upstream thinking gaps from idle
+  // timeouts in intermediaries and clients.
+  const keepaliveTimer = setInterval(() => {
+    if (closed) return;
+    try {
+      res.write(": keepalive\n\n");
+    } catch {
+      // ignore writes on a dying socket
+    }
+  }, SSE_KEEPALIVE_INTERVAL_MS);
+  keepaliveTimer.unref?.();
+
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  let transientRetryCount = 0;
+  let bridgeGeneration = 0;
+  let currentBridge = bridge;
+  let currentHeartbeatTimer = heartbeatTimer;
+
   const closeResponse = () => {
     if (closed) return;
     closed = true;
+    clearInterval(keepaliveTimer);
+    if (retryTimer) clearTimeout(retryTimer);
     res.end();
   };
 
@@ -1674,19 +1764,72 @@ function writeSSEStream(
     if (cancelled || closed) return;
     debugLog("stream.client_close", { requestId, bridgeKey, convKey });
     cancelled = true;
-    cleanupBridge(bridge, heartbeatTimer, bridgeKey);
+    cleanupBridge(currentBridge, currentHeartbeatTimer, bridgeKey);
     closeResponse();
   };
   req.on("close", onClientClose);
   res.on("close", onClientClose);
 
-  const processChunk = createConnectFrameParser(
-    (messageBytes) => {
-      try {
+  /**
+   * Transparently restart the upstream run after a transient failure.
+   * Only safe before any output was emitted downstream.
+   */
+  const attemptTransientRetry = (reason: string, code: string | null): boolean => {
+    if (!restartBridge || cancelled || closed || emittedOutput || transientRetryCount >= TRANSIENT_RETRY_MAX) {
+      return false;
+    }
+    transientRetryCount += 1;
+    bridgeGeneration += 1; // invalidate the failed bridge's handlers
+    const retryGeneration = bridgeGeneration;
+    const delayMs = TRANSIENT_RETRY_BASE_DELAY_MS * transientRetryCount;
+    debugLog("stream.transient_retry", { requestId, bridgeKey, convKey, modelId, reason, code, attempt: transientRetryCount, delayMs });
+    console.error(`[cursor-provider] ${reason} (${modelId}) — restarting upstream run (attempt ${transientRetryCount}/${TRANSIENT_RETRY_MAX})`);
+    clearInterval(currentHeartbeatTimer);
+    activeBridges.delete(bridgeKey);
+    try { currentBridge.end(); } catch { /* already dead */ }
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      if (closed || cancelled) return;
+      const next = restartBridge();
+      currentBridge = next.bridge;
+      currentHeartbeatTimer = next.heartbeatTimer;
+      attachBridge(currentBridge, currentHeartbeatTimer, retryGeneration);
+    }, delayMs);
+    retryTimer.unref?.();
+    return true;
+  };
+
+  const handleEndStream = (endStreamBytes: Uint8Array, generation: number) => {
+    if (generation !== bridgeGeneration) return;
+    const endError = parseConnectEndStream(endStreamBytes);
+    if (!endError) return;
+
+    if (isTransientConnectCode(endError.code) && attemptTransientRetry("Cursor stream error", endError.code)) {
+      return;
+    }
+
+    console.error(`[cursor-provider] Cursor stream error (${modelId}):`, endError.message);
+    // Transient upstream failures (e.g. rate limits) don't imply the stored
+    // checkpoint is bad — keep it so the next request resumes cheaply.
+    // Permanent errors may indicate stale state, so drop it as before.
+    if (!isTransientConnectCode(endError.code)) {
+      conversationStates.delete(convKey);
+    }
+    sendSSE(makeChunk({ content: endError.message }, "error"));
+    sendSSE(makeUsageChunk());
+    sendDone();
+    closeResponse();
+  };
+
+  const attachBridge = (b: BridgeHandle, hb: ReturnType<typeof setInterval>, generation: number) => {
+    b.onData(createConnectFrameParser(
+      (messageBytes) => {
+        if (generation !== bridgeGeneration) return;
+        try {
         const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
         processServerMessage(
           serverMessage, blobStore, mcpTools,
-          (data) => bridge.write(data),
+          (data) => currentBridge.write(data),
           state,
           (text, isThinking) => {
             if (isThinking) {
@@ -1727,7 +1870,7 @@ function writeSSEStream(
             }));
 
             activeBridges.set(bridgeKey, {
-              bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs: state.pendingExecs, currentTurn,
+              bridge: currentBridge, heartbeatTimer: currentHeartbeatTimer, blobStore, mcpTools, pendingExecs: state.pendingExecs, currentTurn,
             });
             debugLog("stream.tool_call_pause", { requestId, bridgeKey, exec, pendingExecs: state.pendingExecs, currentTurn });
 
@@ -1750,27 +1893,14 @@ function writeSSEStream(
       } catch (err) {
         console.error("[cursor-provider] Stream message processing error:", err instanceof Error ? err.message : err);
       }
-    },
-    (endStreamBytes) => {
-      const endError = parseConnectEndStream(endStreamBytes);
-      if (endError) {
-        console.error(`[cursor-provider] Cursor stream error (${modelId}):`, endError.message);
-        conversationStates.delete(convKey);
-        sendSSE(makeChunk({ content: endError.message }, "error"));
-        sendSSE(makeUsageChunk());
-        sendDone();
-        closeResponse();
-      }
-    },
-  );
+      },
+      (endStreamBytes) => handleEndStream(endStreamBytes, generation),
+    ));
 
-  bridge.onData(processChunk);
-
-  bridge.onClose((code) => {
+    b.onClose((code) => {
+    if (generation !== bridgeGeneration) return;
     debugLog("stream.bridge_close", { requestId, bridgeKey, convKey, code, cancelled, mcpExecReceived, currentTurn, latestCheckpoint });
-    clearInterval(heartbeatTimer);
-    req.removeListener("close", onClientClose);
-    res.removeListener("close", onClientClose);
+    clearInterval(hb);
     const stored = conversationStates.get(convKey);
     if (stored) {
       for (const [k, v] of blobStore) stored.blobStore.set(k, v);
@@ -1780,8 +1910,26 @@ function writeSSEStream(
         debugLog("stream.checkpoint_committed", { requestId, convKey, stored });
       }
     }
-    if (cancelled) return;
+    if (cancelled) {
+      req.removeListener("close", onClientClose);
+      res.removeListener("close", onClientClose);
+      return;
+    }
+    // Bridge died without an upstream end-stream error (e.g. h2 failure):
+    // restart the run transparently while no output was emitted yet.
+    if (!mcpExecReceived && code !== 0 && attemptTransientRetry("Bridge connection lost", null)) {
+      return;
+    }
+    req.removeListener("close", onClientClose);
+    res.removeListener("close", onClientClose);
     if (!mcpExecReceived) {
+      if (code !== 0) {
+        sendSSE(makeChunk({ content: "Bridge connection lost" }, "error"));
+        sendSSE(makeUsageChunk());
+        sendDone();
+        closeResponse();
+        return;
+      }
       const flushed = tagFilter.flush();
       if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
       if (flushed.content) {
@@ -1799,7 +1947,10 @@ function writeSSEStream(
       closeResponse();
       activeBridges.delete(bridgeKey);
     }
-  });
+    });
+  };
+
+  attachBridge(currentBridge, currentHeartbeatTimer, bridgeGeneration);
 }
 
 export function writeSSEStreamForTests(args: {
@@ -1815,6 +1966,7 @@ export function writeSSEStreamForTests(args: {
   req: IncomingMessage;
   res: ServerResponse;
   requestId?: string;
+  restartBridge?: () => { bridge: BridgeHandle; heartbeatTimer: ReturnType<typeof setInterval> };
 }): void {
   writeSSEStream(
     args.bridge,
@@ -1829,6 +1981,7 @@ export function writeSSEStreamForTests(args: {
     args.req,
     args.res,
     args.requestId,
+    args.restartBridge,
   );
 }
 
@@ -1955,7 +2108,7 @@ async function handleNonStreamingResponse(
   const state: StreamState = { toolCallIndex: 0, pendingExecs: [], outputTokens: 0, totalTokens: 0 };
   const tagFilter = createThinkingTagFilter();
   let fullText = "";
-  let nonStreamError: Error | null = null;
+  let nonStreamError: ConnectStreamError | null = null;
   let latestCheckpoint: Uint8Array | null = null;
 
   return new Promise((resolve) => {
@@ -1994,7 +2147,11 @@ async function handleNonStreamingResponse(
         const endError = parseConnectEndStream(endStreamBytes);
         if (endError) {
           console.error(`[cursor-provider] Cursor non-stream error (${modelId}):`, endError.message);
-          conversationStates.delete(convKey);
+          // Keep the stored checkpoint for transient upstream failures so the
+          // next request can resume instead of rebuilding the full history.
+          if (!isTransientConnectCode(endError.code)) {
+            conversationStates.delete(convKey);
+          }
           nonStreamError = endError;
         }
       },

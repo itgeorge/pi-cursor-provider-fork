@@ -23,7 +23,10 @@
 import http2 from "node:http2";
 import crypto from "node:crypto";
 
-const CURSOR_CLIENT_VERSION = "cli-2026.01.09-231024f";
+// Fallback only — the parent process passes the client version in the config
+// message (see resolveCursorClientVersion in proxy.ts). Cursor gates model
+// availability by client version, so this must track a recent Cursor CLI.
+const CURSOR_CLIENT_VERSION = "cli-2026.09.23-86fc751";
 
 /** Write one length-prefixed message to stdout. */
 function writeMessage(data) {
@@ -86,6 +89,7 @@ if (!configBuf) process.exit(1);
 
 const config = JSON.parse(configBuf.toString("utf8"));
 const { accessToken, url, path: rpcPath, unary } = config;
+const clientVersion = config.clientVersion || CURSOR_CLIENT_VERSION;
 
 const client = http2.connect(url || "https://api2.cursor.sh");
 
@@ -116,7 +120,7 @@ const headers = {
   te: "trailers",
   authorization: `Bearer ${accessToken}`,
   "x-ghost-mode": "true",
-  "x-cursor-client-version": CURSOR_CLIENT_VERSION,
+  "x-cursor-client-version": clientVersion,
   "x-cursor-client-type": "cli",
   "x-request-id": crypto.randomUUID(),
 };

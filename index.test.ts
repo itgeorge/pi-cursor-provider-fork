@@ -1,5 +1,5 @@
 import rawModels from "./cursor-models-raw.json";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,6 +8,7 @@ import { request as httpRequest } from "node:http";
 import cursorProviderExtension, { buildEffortMap, FALLBACK_MODELS, getStoredCursorAccessToken, parseModelId, processModels, registerSessionLifecycleCleanup, supportsReasoningModelId } from "./index.ts";
 import {
   resolveModelId,
+  resolveCursorClientVersion,
   __testInternals,
   cleanupAllSessionState,
   cleanupSessionState,
@@ -1869,3 +1870,252 @@ describe("proxy integration — session handling", () => {
 
 });
 
+
+// ── Stream resilience (headers, keepalive, transient retry) ──
+
+describe("cursor client version", () => {
+  test("defaults to a recent Cursor CLI version", () => {
+    expect(resolveCursorClientVersion({})).toBe("cli-2026.09.23-86fc751");
+  });
+
+  test("honors PI_CURSOR_CLIENT_VERSION override", () => {
+    expect(resolveCursorClientVersion({ PI_CURSOR_CLIENT_VERSION: "cli-2099.01.01-deadbeef" })).toBe("cli-2099.01.01-deadbeef");
+    expect(resolveCursorClientVersion({ PI_CURSOR_CLIENT_VERSION: "   " })).toBe("cli-2026.09.23-86fc751");
+  });
+});
+
+describe("stream resilience", () => {
+  function makeFakeRes() {
+    const writes: string[] = [];
+    let flushCount = 0;
+    let ended = false;
+    const res = new EventEmitter() as any;
+    res.headersSent = false;
+    res.writeHead = () => { res.headersSent = true; return res; };
+    res.flushHeaders = () => { flushCount += 1; };
+    res.write = (chunk: string) => { writes.push(chunk); return true; };
+    res.end = () => { res.headersSent = true; ended = true; queueMicrotask(() => res.emit("close")); return res; };
+    return { res, writes, isEnded: () => ended, flushCount: () => flushCount };
+  }
+
+  function seedConversation(convKey: string) {
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: `conv-${convKey}`,
+      checkpoint: new Uint8Array([9, 9, 9]),
+      sessionScoped: true,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    });
+  }
+
+  test("flushes SSE headers immediately, before any upstream output", () => {
+    const { res, flushCount } = makeFakeRes();
+    const bridge = new FakeBridge({ accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" });
+
+    writeSSEStreamForTests({
+      bridge: bridge as any,
+      heartbeatTimer: setInterval(() => {}, 60_000),
+      modelId: "composer-2.5",
+      bridgeKey: "bk-flush",
+      convKey: "ck-flush",
+      completedTurns: [],
+      currentTurn: turn("hi"),
+      req: new EventEmitter() as any,
+      res,
+    });
+
+    expect(res.headersSent).toBe(true);
+    expect(flushCount()).toBe(1);
+    bridge.close(0);
+  });
+
+  test("writes SSE keepalive comments while waiting and stops after close", async () => {
+    vi.useFakeTimers();
+    try {
+      const { res, writes } = makeFakeRes();
+      const bridge = new FakeBridge({ accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" });
+
+      writeSSEStreamForTests({
+        bridge: bridge as any,
+        heartbeatTimer: setInterval(() => {}, 60_000),
+        modelId: "composer-2.5",
+        bridgeKey: "bk-keepalive",
+        convKey: "ck-keepalive",
+        completedTurns: [],
+        currentTurn: turn("hi"),
+        req: new EventEmitter() as any,
+        res,
+      });
+
+      vi.advanceTimersByTime(31_000);
+      expect(writes.filter((w) => w === ": keepalive\n\n")).toHaveLength(2);
+
+      bridge.emitServerMessage(makeTextDeltaMessage("hello"));
+      bridge.close(0);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(writes.some((w) => w.includes('"content":"hello"'))).toBe(true);
+
+      const countAfterClose = writes.filter((w) => w === ": keepalive\n\n").length;
+      vi.advanceTimersByTime(60_000);
+      expect(writes.filter((w) => w === ": keepalive\n\n")).toHaveLength(countAfterClose);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("retries transient upstream errors transparently when no output was emitted", async () => {
+    vi.useFakeTimers();
+    try {
+      const { res, writes } = makeFakeRes();
+      const convKey = "ck-retry-ok";
+      seedConversation(convKey);
+      const bridges: FakeBridge[] = [];
+      const makeBridge = () => {
+        const b = new FakeBridge({ accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" });
+        bridges.push(b);
+        return { bridge: b as any, heartbeatTimer: setInterval(() => {}, 60_000) };
+      };
+      const first = makeBridge();
+      let restartCalls = 0;
+
+      writeSSEStreamForTests({
+        bridge: first.bridge,
+        heartbeatTimer: first.heartbeatTimer,
+        modelId: "cursor-grok-4.5",
+        bridgeKey: "bk-retry-ok",
+        convKey,
+        completedTurns: [],
+        currentTurn: turn("hi"),
+        req: new EventEmitter() as any,
+        res,
+        restartBridge: () => { restartCalls += 1; return makeBridge(); },
+      });
+
+      bridges[0]!.emitEndStream({ error: { code: "resource_exhausted", message: "rate limited" } });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(restartCalls).toBe(0); // backoff pending
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(restartCalls).toBe(1);
+      expect(bridges).toHaveLength(2);
+
+      bridges[1]!.emitServerMessage(makeTextDeltaMessage("recovered"));
+      bridges[1]!.close(0);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const body = writes.join("");
+      expect(body).toContain('"content":"recovered"');
+      expect(body).toContain('"finish_reason":"stop"');
+      expect(body).not.toContain("Connect error");
+      // Transient failure must not nuke the stored conversation state
+      expect(__testInternals.conversationStates.has(convKey)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("gives up after max transient retries, emits the error, and keeps conversation state", async () => {
+    vi.useFakeTimers();
+    try {
+      const { res, writes } = makeFakeRes();
+      const convKey = "ck-retry-exhausted";
+      seedConversation(convKey);
+      const bridges: FakeBridge[] = [];
+      const makeBridge = () => {
+        const b = new FakeBridge({ accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" });
+        bridges.push(b);
+        return { bridge: b as any, heartbeatTimer: setInterval(() => {}, 60_000) };
+      };
+      const first = makeBridge();
+
+      writeSSEStreamForTests({
+        bridge: first.bridge,
+        heartbeatTimer: first.heartbeatTimer,
+        modelId: "cursor-grok-4.5",
+        bridgeKey: "bk-retry-exhausted",
+        convKey,
+        completedTurns: [],
+        currentTurn: turn("hi"),
+        req: new EventEmitter() as any,
+        res,
+        restartBridge: makeBridge,
+      });
+
+      for (let i = 0; i < 3; i++) {
+        const b = bridges[bridges.length - 1]!;
+        b.emitEndStream({ error: { code: "unavailable", message: "backend down" } });
+        await vi.advanceTimersByTimeAsync(10_000); // covers any backoff
+      }
+
+      expect(bridges).toHaveLength(3); // initial + 2 retries, no more
+      const body = writes.join("");
+      expect(body).toContain("Connect error unavailable: backend down");
+      expect(body).toContain('"finish_reason":"error"');
+      expect(__testInternals.conversationStates.has(convKey)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("does not retry permanent errors and drops conversation state", async () => {
+    const { res, writes } = makeFakeRes();
+    const convKey = "ck-permanent";
+    seedConversation(convKey);
+    const bridge = new FakeBridge({ accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" });
+    let restartCalls = 0;
+
+    writeSSEStreamForTests({
+      bridge: bridge as any,
+      heartbeatTimer: setInterval(() => {}, 60_000),
+      modelId: "cursor-grok-4.6",
+      bridgeKey: "bk-permanent",
+      convKey,
+      completedTurns: [],
+      currentTurn: turn("hi"),
+      req: new EventEmitter() as any,
+      res,
+      restartBridge: () => { restartCalls += 1; throw new Error("must not be called"); },
+    });
+
+    bridge.emitEndStream({ error: { code: "not_found", message: "model unavailable" } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(restartCalls).toBe(0);
+    const body = writes.join("");
+    expect(body).toContain("Connect error not_found: model unavailable");
+    expect(body).toContain('"finish_reason":"error"');
+    expect(__testInternals.conversationStates.has(convKey)).toBe(false);
+  });
+
+  test("does not retry once output was emitted downstream", async () => {
+    const { res, writes } = makeFakeRes();
+    const convKey = "ck-no-retry-after-output";
+    seedConversation(convKey);
+    const bridge = new FakeBridge({ accessToken: "test-token", rpcPath: "/agent.v1.AgentService/Run" });
+    let restartCalls = 0;
+
+    writeSSEStreamForTests({
+      bridge: bridge as any,
+      heartbeatTimer: setInterval(() => {}, 60_000),
+      modelId: "composer-2.5",
+      bridgeKey: "bk-no-retry-after-output",
+      convKey,
+      completedTurns: [],
+      currentTurn: turn("hi"),
+      req: new EventEmitter() as any,
+      res,
+      restartBridge: () => { restartCalls += 1; throw new Error("must not be called"); },
+    });
+
+    bridge.emitServerMessage(makeTextDeltaMessage("partial"));
+    bridge.emitEndStream({ error: { code: "resource_exhausted", message: "rate limited" } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(restartCalls).toBe(0);
+    const body = writes.join("");
+    expect(body).toContain('"content":"partial"');
+    expect(body).toContain('"finish_reason":"error"');
+    // transient error → state kept even without retry
+    expect(__testInternals.conversationStates.has(convKey)).toBe(true);
+  });
+});
